@@ -1,5 +1,6 @@
 # ===============================================================================
 # Copyright 2015 Jake Ross
+# Modified 2018 Jingyee Chee
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,16 +15,134 @@
 # limitations under the License.
 # ===============================================================================
 
-# ============= enthought library imports =======================
+"""
+ToupCam Python Interface Modified for Python 3
+and support for capturing raw format
+"""
 # ============= standard library imports ========================
 import ctypes
 import os
+import numpy as np
+import PIL
+from io import StringIO
 
-from PIL import Image
-from numpy import zeros, uint8, uint32
-from cStringIO import StringIO
 # ============= local library imports  ==========================
 from core import lib, TOUPCAM_EVENT_IMAGE, TOUPCAM_EVENT_STILLIMAGE, success, HToupCam
+
+
+class ToupCamCameraRaw(object):
+    'ToupCam python cDLL Interface for raw image output'
+    _frame_fn = None
+    _save_path = 'temp.png'
+
+    def __init__(self, resolution=2, bits=32):
+        if bits not in (32,):
+            raise ValueError('Bits needs to by 8 or 32')
+        # bits = 8
+        self.resolution = resolution
+        self.cam = self.get_camera()
+        self.bits = bits
+
+    @classmethod
+    def get_camera(cls, cid=None):
+        'returns the camera id'
+        func = lib.Toupcam_Open
+        func.restype = ctypes.POINTER(HToupCam)
+        return func(cid)
+
+    @classmethod
+    def get_pil_image(cls, data):
+        'convert PIL image data to an Image object'
+        # TODO fix RAW image conversion
+
+        raw = data.view(np.uint8).reshape(data.shape + (-1,))
+        bgr = raw[..., :3]
+        image = PIL.Image.fromarray(bgr, 'RGB')
+        b, g, r = image.split()
+        return PIL.Image.merge('RGB', (r, g, b))
+
+    def _do_save(self, imagedata):
+        'save PIL image to the path, called by the callback function'
+        image_PIL = self.get_pil_image(imagedata)
+        image_PIL.save(self._save_path)
+
+    def cam_open(self):
+        'Open camera'
+        self.set_esize(self.resolution)
+        args = self.get_size()
+        if not args:
+            print('Camera not open!')
+            return
+
+        def get_frame(nEvent, ctx):
+            'callback function, to be stored in _frame_fn'
+            #ctx is not used
+            if nEvent == TOUPCAM_EVENT_STILLIMAGE:
+                w, h = self.get_size()
+                h, w = h.value, w.value
+
+                still = np.zeros((h, w), dtype=np.uint32)
+                lib.Toupcam_PullStillImage(self.cam, ctypes.c_void_p(
+                    still.ctypes.data), None, None, None)
+                # lib.Toupcam_PullStillImage(handle,void_pointer_pImageData,
+                # int bits,unsigned pointer pnWidth,unsigned pointer pnHeight)
+                self._do_save(still)
+
+        # converts get_frame into a C function
+        # with None returned, and arguments (int, void*)
+        callback = ctypes.CFUNCTYPE(None, ctypes.c_uint, ctypes.c_void_p)
+        self._frame_fn = callback(get_frame)
+
+        # try to set camera to raw output
+        result1 = lib.Toupcam_put_option(
+            self.cam, ctypes.c_uint(0x04), ctypes.c_uint(0x1))
+        print('set to raw? result = {}'.format(result1))
+
+        # Start Camera Pull Mode
+        result = lib.Toupcam_StartPullModeWithCallback(
+            self.cam, self._frame_fn)
+        return success(result)
+
+    def cam_close(self):
+        'close camera'
+        if self.cam:
+            lib.Toupcam_Close(self.cam)
+
+    def snap(self):
+        'snap a single image'
+        lib.Toupcam_Snap(self.cam, ctypes.c_uint(0))
+
+    def get_raw_format(self):
+        'get raw format'
+        nFourCC = ctypes.c_uint(0)
+        bitsPerPixel = ctypes.c_uint(0)
+        result = lib.Toupcam_get_RawFormat(
+            self.cam, ctypes.byref(nFourCC), ctypes.byref(bitsPerPixel))
+        if success(result):
+            print(bitsPerPixel.value)
+            print(nFourCC.value)
+            return nFourCC.value
+        # {
+            #	wchar_t str[257];
+            #	swprintf(str, L"FourCC:0x%08x, %c%c%c%c\nBits per Pixel: %u",
+            # nFourCC, (char)(nFourCC & 0xff), (char)((nFourCC >> 8) & 0xff),
+            # (char)((nFourCC >> 16) & 0xff), (char)((nFourCC >> 24) & 0xff),
+            # bitsperpixel);
+            #	AtlMessageBox(m_hWnd, str, L"Raw Format");
+            # }
+
+    def set_esize(self, nres):
+        'set e size, nres = 0,1,or 2'
+        lib.Toupcam_put_eSize(self.cam, ctypes.c_ulong(nres))
+
+    def get_size(self):
+        'get width and height of image in pixels'
+        w, h = ctypes.c_long(), ctypes.c_long()
+
+        result = lib.Toupcam_get_Size(
+            self.cam, ctypes.byref(w), ctypes.byref(h))
+        if success(result):
+            return w, h
 
 
 class ToupCamCamera(object):
@@ -69,21 +188,21 @@ class ToupCamCamera(object):
         if data is None:
             data = self._data
 
-        raw = data.view(uint8).reshape(data.shape + (-1,))
+        raw = data.view(np.uint8).reshape(data.shape + (-1,))
         bgr = raw[..., :3]
-        image = Image.fromarray(bgr, 'RGB')
+        image = PIL.Image.fromarray(bgr, 'RGB')
         b, g, r = image.split()
-        return Image.merge('RGB', (r, g, b))
+        return PIL.Image.merge('RGB', (r, g, b))
 
-    def get_image_data(self, *args, **kw):
+    def get_image_data(self):
         d = self._data
         return d
 
-    def close(self):
+    def cam_close(self):
         if self.cam:
             lib.Toupcam_Close(self.cam)
 
-    def open(self):
+    def cam_open(self):
         self.set_esize(self.resolution)
         args = self.get_size()
         if not args:
@@ -93,11 +212,11 @@ class ToupCamCamera(object):
 
         shape = (h, w)
         if self.bits == 8:
-            dtype = uint8
+            dtype = np.uint8
         else:
-            dtype = uint32
+            dtype = np.uint32
 
-        self._data = zeros(shape, dtype=dtype)
+        self._data = np.zeros(shape, dtype=dtype)
 
         bits = ctypes.c_int(self.bits)
 
@@ -113,14 +232,16 @@ class ToupCamCamera(object):
                 w, h = self.get_size()
                 h, w = h.value, w.value
 
-                still = zeros((h, w), dtype=uint32)
-                lib.Toupcam_PullStillImage(self.cam, ctypes.c_void_p(still.ctypes.data), bits, None, None)
+                still = np.zeros((h, w), dtype=np.uint32)
+                lib.Toupcam_PullStillImage(self.cam, ctypes.c_void_p(
+                    still.ctypes.data), bits, None, None)
                 self._do_save(still)
 
         callback = ctypes.CFUNCTYPE(None, ctypes.c_uint, ctypes.c_void_p)
         self._frame_fn = callback(get_frame)
 
-        result = lib.Toupcam_StartPullModeWithCallback(self.cam, self._frame_fn)
+        result = lib.Toupcam_StartPullModeWithCallback(
+            self.cam, self._frame_fn)
 
         return success(result)
 
@@ -204,7 +325,8 @@ class ToupCamCamera(object):
 
     def get_auto_exposure(self):
         expo_enabled = ctypes.c_bool()
-        result = lib.Toupcam_get_AutoExpoEnable(self.cam, ctypes.byref(expo_enabled))
+        result = lib.Toupcam_get_AutoExpoEnable(
+            self.cam, ctypes.byref(expo_enabled))
         if success(result):
             return expo_enabled.value
 
@@ -214,8 +336,7 @@ class ToupCamCamera(object):
     def get_camera(self, cid=None):
         func = lib.Toupcam_Open
         func.restype = ctypes.POINTER(HToupCam)
-        cam = func(cid)
-        return cam
+        return func(cid)
 
     def get_serial(self):
         sn = ctypes.create_string_buffer(32)
@@ -239,7 +360,8 @@ class ToupCamCamera(object):
     def get_size(self):
         w, h = ctypes.c_long(), ctypes.c_long()
 
-        result = lib.Toupcam_get_Size(self.cam, ctypes.byref(w), ctypes.byref(h))
+        result = lib.Toupcam_get_Size(
+            self.cam, ctypes.byref(w), ctypes.byref(h))
         if success(result):
             return w, h
 
@@ -255,11 +377,11 @@ class ToupCamCamera(object):
 
 if __name__ == '__main__':
     import time
-    cam = ToupCamCamera()
-    cam.open()
+    cam = ToupCamCameraRaw()
+    cam.cam_open()
     time.sleep(1)
 
-    cam.save('foo.jpg')
+    cam.snap()
 
 
 # ============= EOF =============================================
